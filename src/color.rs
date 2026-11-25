@@ -1,6 +1,5 @@
 use anyhow::{anyhow, Result};
-use xcb::xproto;
-use xcb::Connection;
+use xcb::{x, Connection};
 
 #[derive(Clone, Copy, PartialEq)]
 pub struct ARGB {
@@ -84,20 +83,19 @@ impl From<ARGB> for u32 {
 
 pub fn window_rect(
     conn: &Connection,
-    window: xproto::Window,
+    window: x::Window,
     (x, y, width, height): (i16, i16, u16, u16),
 ) -> Result<Vec<ARGB>> {
-    let reply = xproto::get_image(
-        conn,
-        xproto::IMAGE_FORMAT_Z_PIXMAP as u8,
-        window,
+    let cookie = conn.send_request(&x::GetImage {
+        format: x::ImageFormat::ZPixmap,
+        drawable: x::Drawable::Window(window),
         x,
         y,
         width,
         height,
-        u32::MAX,
-    )
-    .get_reply()?;
+        plane_mask: u32::MAX,
+    });
+    let reply = conn.wait_for_reply(cookie)?;
 
     if reply.depth() != 24 {
         // TODO: Figure out what to do with these

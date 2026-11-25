@@ -1,8 +1,6 @@
 use anyhow::{anyhow, Result};
 use x11::xcursor::{XcursorImageCreate, XcursorImageDestroy, XcursorImageLoadCursor};
-use xcb::base as xbase;
-use xcb::base::Connection;
-use xcb::xproto;
+use xcb::{x, Connection, Xid, XidNew};
 
 use crate::color::{self, ARGB};
 use crate::draw::{draw_color_text, draw_magnifying_glass};
@@ -10,27 +8,28 @@ use crate::pixel::PixelSquare;
 use crate::util::EnsureOdd;
 
 // Left mouse button
-const SELECTION_BUTTON: xproto::Button = 1;
+const SELECTION_BUTTON: u8 = 1;
 // ESC key code
 const ESC_KEY: u8 = 9;
-const GRAB_MASK: u16 = (xproto::EVENT_MASK_BUTTON_PRESS | xproto::EVENT_MASK_POINTER_MOTION) as u16;
+fn grab_mask() -> x::EventMask {
+    x::EventMask::BUTTON_PRESS | x::EventMask::POINTER_MOTION
+}
 
 // Exclusively grabs the pointer so we get all its events
-fn grab_pointer(conn: &Connection, root: u32, cursor: u32) -> Result<()> {
-    let reply = xproto::grab_pointer(
-        conn,
-        false,
-        root,
-        GRAB_MASK,
-        xproto::GRAB_MODE_ASYNC as u8,
-        xproto::GRAB_MODE_ASYNC as u8,
-        xbase::NONE,
-        cursor,
-        xbase::CURRENT_TIME,
-    )
-    .get_reply()?;
+fn grab_pointer(conn: &Connection, root: x::Window, cursor: u32) -> Result<()> {
+    let cookie = conn.send_request(&x::GrabPointer {
+        owner_events: false,
+        grab_window: root,
+        event_mask: grab_mask(),
+        pointer_mode: x::GrabMode::Async,
+        keyboard_mode: x::GrabMode::Async,
+        confine_to: x::Window::none(),
+        cursor: x::Cursor::new(cursor),
+        time: x::CURRENT_TIME,
+    });
+    let reply = conn.wait_for_reply(cookie)?;
 
-    if reply.status() != xproto::GRAB_STATUS_SUCCESS as u8 {
+    if reply.status() != x::GrabStatus::Success {
         return Err(anyhow!("Could not grab pointer"));
     }
 
@@ -38,18 +37,17 @@ fn grab_pointer(conn: &Connection, root: u32, cursor: u32) -> Result<()> {
 }
 
 // Exclusively grabs the keyboard so we get all its events
-fn grab_keyboard(conn: &Connection, root: u32) -> Result<()> {
-    let reply = xproto::grab_keyboard(
-        conn,
-        false,
-        root,
-        xbase::CURRENT_TIME,
-        xproto::GRAB_MODE_ASYNC as u8,
-        xproto::GRAB_MODE_ASYNC as u8,
-    )
-    .get_reply()?;
+fn grab_keyboard(conn: &Connection, root: x::Window) -> Result<()> {
+    let cookie = conn.send_request(&x::GrabKeyboard {
+        owner_events: false,
+        grab_window: root,
+        time: x::CURRENT_TIME,
+        pointer_mode: x::GrabMode::Async,
+        keyboard_mode: x::GrabMode::Async,
+    });
+    let reply = conn.wait_for_reply(cookie)?;
 
-    if reply.status() != xproto::GRAB_STATUS_SUCCESS as u8 {
+    if reply.status() != x::GrabStatus::Success {
         return Err(anyhow!("Could not grab keyboard"));
     }
 
@@ -58,8 +56,11 @@ fn grab_keyboard(conn: &Connection, root: u32) -> Result<()> {
 
 // Updates the cursor for an _already grabbed pointer_
 fn update_cursor(conn: &Connection, cursor: u32) -> Result<()> {
-    xproto::change_active_pointer_grab_checked(conn, cursor, xbase::CURRENT_TIME, GRAB_MASK)
-        .request_check()?;
+    conn.send_and_check_request(&x::ChangeActivePointerGrab {
+        cursor: x::Cursor::new(cursor),
+        time: x::CURRENT_TIME,
+        event_mask: grab_mask(),
+    })?;
 
     Ok(())
 }
@@ -114,7 +115,7 @@ fn create_new_xcursor(
 // sized or misaligned screens
 fn get_window_rect_around_pointer(
     conn: &Connection,
-    screen: &xproto::Screen,
+    screen: &x::Screen,
     (pointer_x, pointer_y): (i16, i16),
     preview_width: u32,
     scale: u32,
@@ -171,7 +172,7 @@ fn get_window_rect_around_pointer(
 
 fn create_new_cursor(
     conn: &Connection,
-    screen: &xproto::Screen,
+    screen: &x::Screen,
     preview_width: u32,
     scale: u32,
     point: Option<(i16, i16)>,
@@ -180,7 +181,8 @@ fn create_new_cursor(
         Some(point) => point,
         None => {
             let root = screen.root();
-            let pointer = xproto::query_pointer(conn, root).get_reply()?;
+            let cookie = conn.send_request(&x::QueryPointer { window: root });
+            let pointer = conn.wait_for_reply(cookie)?;
             (pointer.root_x(), pointer.root_y())
         }
     };
@@ -196,7 +198,7 @@ fn create_new_cursor(
 
 pub fn wait_for_location(
     conn: &Connection,
-    screen: &xproto::Screen,
+    screen: &x::Screen,
     preview_width: u32,
     scale: u32,
 ) -> Result<Option<ARGB>> {
@@ -211,59 +213,47 @@ pub fn wait_for_location(
     let keyboard_grabbed = grab_keyboard(conn, root).is_ok();
 
     let result = loop {
-        let event = conn.wait_for_event();
-        if let Some(event) = event {
-            match event.response_type() {
-                xproto::BUTTON_PRESS => {
-                    let event: &xproto::ButtonPressEvent = unsafe { xbase::cast_event(&event) };
-                    match event.detail() {
-                        SELECTION_BUTTON => {
-                            let pixels = color::window_rect(
-                                conn,
-                                root,
-                                (event.root_x(), event.root_y(), 1, 1),
-                            )?;
-
-                            break Some(pixels[0]);
-                        }
-                        _ => {}
-                    }
-                }
-                xproto::KEY_PRESS => {
-                    if keyboard_grabbed {
-                        let event: &xproto::KeyPressEvent = unsafe { xbase::cast_event(&event) };
-                        if event.detail() == ESC_KEY {
-                            break None;
-                        }
-                    }
-                }
-                xproto::MOTION_NOTIFY => {
-                    let event: &xproto::MotionNotifyEvent = unsafe { xbase::cast_event(&event) };
-                    let new_cursor = create_new_cursor(
-                        conn,
-                        screen,
-                        preview_width,
-                        scale,
-                        Some((event.root_x(), event.root_y())),
-                    )?;
-                    update_cursor(conn, new_cursor)?;
-
-                    xproto::free_cursor(conn, cursor);
-                    cursor = new_cursor;
-                }
-                _ => {}
+        match conn.wait_for_event()? {
+            xcb::Event::X(x::Event::ButtonPress(event)) if event.detail() == SELECTION_BUTTON => {
+                let pixels =
+                    color::window_rect(conn, root, (event.root_x(), event.root_y(), 1, 1))?;
+                break Some(pixels[0]);
             }
-        } else {
-            break None;
+            xcb::Event::X(x::Event::KeyPress(event))
+                if keyboard_grabbed && event.detail() == ESC_KEY =>
+            {
+                break None
+            }
+            xcb::Event::X(x::Event::MotionNotify(event)) => {
+                let new_cursor = create_new_cursor(
+                    conn,
+                    screen,
+                    preview_width,
+                    scale,
+                    Some((event.root_x(), event.root_y())),
+                )?;
+                update_cursor(conn, new_cursor)?;
+                conn.send_request(&x::FreeCursor {
+                    cursor: x::Cursor::new(cursor),
+                });
+                cursor = new_cursor;
+            }
+            _ => {}
         }
     };
 
-    xproto::ungrab_pointer(conn, xbase::CURRENT_TIME);
+    conn.send_request(&x::UngrabPointer {
+        time: x::CURRENT_TIME,
+    });
     if keyboard_grabbed {
-        xproto::ungrab_keyboard(conn, xbase::CURRENT_TIME);
+        conn.send_request(&x::UngrabKeyboard {
+            time: x::CURRENT_TIME,
+        });
     }
-    xproto::free_cursor(conn, cursor);
-    conn.flush();
+    conn.send_request(&x::FreeCursor {
+        cursor: x::Cursor::new(cursor),
+    });
+    conn.flush()?;
 
     Ok(result)
 }

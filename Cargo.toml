@@ -10,7 +10,6 @@ license = "MIT"
 readme = "README.md"
 categories = ["command-line-utilities"]
 keywords = ["color", "utility", "color-picker", "x11"]
-homepage = "https://github.com/Soft/xcolor"
 repository = "https://github.com/Soft/xcolor"
 build = "build.rs"
 exclude = ["_config.yml"]
@@ -28,7 +27,7 @@ version = "2"
 features = ["xlib", "xcursor"]
 
 [dependencies.xcb]
-version = "0.9"
+version = "1.7.1"
 features = ["xlib_xcb"]
 
 [build-dependencies]

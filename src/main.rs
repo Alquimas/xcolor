@@ -11,7 +11,7 @@ mod util;
 use anyhow::{anyhow, Result};
 use clap::{value_t, ArgMatches, ErrorKind};
 use nix::unistd::ForkResult;
-use xcb::base::Connection;
+use xcb::Connection;
 
 use crate::cli::get_cli;
 use crate::format::{Format, FormatColor, FormatString};

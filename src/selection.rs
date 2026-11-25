@@ -2,12 +2,9 @@ use anyhow::{anyhow, Error, Result};
 use nix::unistd::{self, fork, ForkResult};
 use std::fs;
 use std::io;
-use std::os::unix::io::AsRawFd;
-use std::os::unix::io::IntoRawFd;
+use std::os::unix::io::{AsRawFd, IntoRawFd};
 use std::str::FromStr;
-use xcb::base as xbase;
-use xcb::base::Connection;
-use xcb::xproto;
+use xcb::{x, Connection, Xid};
 
 use crate::atoms;
 
@@ -43,131 +40,101 @@ pub enum Selection {
 
 impl FromStr for Selection {
     type Err = Error;
-
-    fn from_str(string: &str) -> Result<Selection, Self::Err> {
+    fn from_str(string: &str) -> Result<Self, Self::Err> {
         match string {
-            "primary" => Ok(Selection::Primary),
-            "secondary" => Ok(Selection::Secondary),
-            "clipboard" => Ok(Selection::Clipboard),
+            "primary" => Ok(Self::Primary),
+            "secondary" => Ok(Self::Secondary),
+            "clipboard" => Ok(Self::Clipboard),
             _ => Err(anyhow!("Invalid selection")),
         }
     }
 }
 
 impl Selection {
-    fn to_atom(&self, conn: &Connection) -> Result<xproto::Atom> {
+    fn to_atom(&self, conn: &Connection) -> Result<x::Atom> {
         Ok(match *self {
-            Selection::Primary => atoms::get(conn, "PRIMARY")?,
-            Selection::Secondary => atoms::get(conn, "SECONDARY")?,
-            Selection::Clipboard => atoms::get(conn, "CLIPBOARD")?,
+            Self::Primary => atoms::get(conn, "PRIMARY")?,
+            Self::Secondary => atoms::get(conn, "SECONDARY")?,
+            Self::Clipboard => atoms::get(conn, "CLIPBOARD")?,
         })
     }
 }
 
-// The selection daemon presented here is not a perfect implementation of the
-// ICCCM recommendation. Currently, it does not support large transfers and does
-// not verify that the requestor has received the data by monitoring for atom
-// deletion. Additionally, we do not support MULTIPLE and TIMESTAMP targets even
-// though those are required by the spec. However, this implements just enough
-// of the spec to work well enough in practice as color codes do not tend to be
-// that large. However, this assumption could of course fail with custom
-// templates.
-
 pub fn set_selection(
     conn: &Connection,
-    root: xproto::Window,
+    root: x::Window,
     selection: &Selection,
     string: &str,
 ) -> Result<()> {
     let selection = selection.to_atom(conn)?;
     let utf8_string = atoms::get(conn, "UTF8_STRING")?;
     let targets = atoms::get(conn, "TARGETS")?;
+    let window: x::Window = conn.generate_id();
 
-    let window = conn.generate_id();
-
-    xproto::create_window(
-        conn,
-        0,      // Depth
-        window, // Window
-        root,   // Parent
-        0,
-        0,
-        1,
-        1,                                      // Size
-        0,                                      // Border
-        xproto::WINDOW_CLASS_INPUT_ONLY as u16, // Class
-        xbase::COPY_FROM_PARENT,                // Visual
-        &[],
-    )
-    .request_check()?;
-
-    // It would be better to use a real timestamp
-    xproto::set_selection_owner(conn, window, selection, xbase::CURRENT_TIME).request_check()?;
-
-    if xproto::get_selection_owner(conn, selection)
-        .get_reply()?
-        .owner()
-        != window
-    {
+    conn.send_and_check_request(&x::CreateWindow {
+        depth: x::COPY_FROM_PARENT as u8,
+        wid: window,
+        parent: root,
+        x: 0,
+        y: 0,
+        width: 1,
+        height: 1,
+        border_width: 0,
+        class: x::WindowClass::InputOnly,
+        visual: x::COPY_FROM_PARENT,
+        value_list: &[],
+    })?;
+    conn.send_and_check_request(&x::SetSelectionOwner {
+        owner: window,
+        selection,
+        time: x::CURRENT_TIME,
+    })?;
+    let owner_cookie = conn.send_request(&x::GetSelectionOwner { selection });
+    if conn.wait_for_reply(owner_cookie)?.owner() != window {
         return Err(anyhow!("Could not take selection ownership"));
     }
 
     loop {
-        let event = conn.wait_for_event();
-        if let Some(event) = event {
-            match event.response_type() {
-                xproto::SELECTION_REQUEST => {
-                    let event: &xproto::SelectionRequestEvent =
-                        unsafe { xbase::cast_event(&event) };
-
-                    // We should check the event timestamp
-
-                    let target = event.target();
-                    let property = if target == utf8_string {
-                        xproto::change_property(
-                            conn,
-                            xproto::PROP_MODE_REPLACE as u8,
-                            event.requestor(),
-                            event.property(),
-                            target,
-                            8,
-                            string.as_bytes(),
-                        )
-                        .request_check()?;
-                        event.property()
-                    } else if target == targets {
-                        xproto::change_property(
-                            conn,
-                            xproto::PROP_MODE_REPLACE as u8,
-                            event.requestor(),
-                            event.property(),
-                            target,
-                            32,
-                            &[targets, utf8_string],
-                        )
-                        .request_check()?;
-                        event.property()
-                    } else {
-                        0
-                    };
-
-                    let response = xproto::SelectionNotifyEvent::new(
-                        event.time(),
-                        event.requestor(),
-                        event.selection(),
-                        target,
-                        property,
-                    );
-                    xproto::send_event(conn, false, event.requestor(), 0, &response)
-                        .request_check()?;
-                }
-                xproto::SELECTION_CLEAR => {
-                    break;
-                }
-                _ => {}
+        match conn.wait_for_event()? {
+            xcb::Event::X(x::Event::SelectionRequest(event)) => {
+                let target = event.target();
+                let property = if target == utf8_string {
+                    conn.send_and_check_request(&x::ChangeProperty {
+                        mode: x::PropMode::Replace,
+                        window: event.requestor(),
+                        property: event.property(),
+                        r#type: target,
+                        data: string.as_bytes(),
+                    })?;
+                    event.property()
+                } else if target == targets {
+                    conn.send_and_check_request(&x::ChangeProperty {
+                        mode: x::PropMode::Replace,
+                        window: event.requestor(),
+                        property: event.property(),
+                        r#type: target,
+                        data: &[targets, utf8_string],
+                    })?;
+                    event.property()
+                } else {
+                    x::Atom::none()
+                };
+                let response = x::SelectionNotifyEvent::new(
+                    event.time(),
+                    event.requestor(),
+                    event.selection(),
+                    target,
+                    property,
+                );
+                conn.send_and_check_request(&x::SendEvent {
+                    propagate: false,
+                    destination: x::SendEventDest::Window(event.requestor()),
+                    event_mask: x::EventMask::NO_EVENT,
+                    event: &response,
+                })?;
             }
-        } else {
-            break;
+            xcb::Event::X(x::Event::SelectionClear(_)) => break,
+            _ => {}
         }
     }
     Ok(())
