@@ -1,6 +1,6 @@
 [package]
 name = "xcolor"
-version = "0.5.1"
+version = "0.5.2"
 description = "Lightweight color picker for X11"
 authors = [
   "Samuel Laurén <samuel.lauren@iki.fi>",

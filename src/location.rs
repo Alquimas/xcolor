@@ -9,8 +9,8 @@ use crate::util::EnsureOdd;
 
 // Left mouse button
 const SELECTION_BUTTON: u8 = 1;
-// ESC key code
-const ESC_KEY: u8 = 9;
+// Right mouse button cancels the selection
+const CANCEL_BUTTON: u8 = 3;
 fn grab_mask() -> x::EventMask {
     x::EventMask::BUTTON_PRESS | x::EventMask::POINTER_MOTION
 }
@@ -30,25 +30,7 @@ fn grab_pointer(conn: &Connection, root: x::Window, cursor: u32) -> Result<()> {
     let reply = conn.wait_for_reply(cookie)?;
 
     if reply.status() != x::GrabStatus::Success {
-        return Err(anyhow!("Could not grab pointer"));
-    }
-
-    Ok(())
-}
-
-// Exclusively grabs the keyboard so we get all its events
-fn grab_keyboard(conn: &Connection, root: x::Window) -> Result<()> {
-    let cookie = conn.send_request(&x::GrabKeyboard {
-        owner_events: false,
-        grab_window: root,
-        time: x::CURRENT_TIME,
-        pointer_mode: x::GrabMode::Async,
-        keyboard_mode: x::GrabMode::Async,
-    });
-    let reply = conn.wait_for_reply(cookie)?;
-
-    if reply.status() != x::GrabStatus::Success {
-        return Err(anyhow!("Could not grab keyboard"));
+        return Err(anyhow!("Could not grab pointer: {:?}", reply.status()));
     }
 
     Ok(())
@@ -209,9 +191,6 @@ pub fn wait_for_location(
     let mut cursor = create_new_cursor(conn, screen, preview_width, scale, None)?;
     grab_pointer(conn, root, cursor)?;
 
-    // Try to grab keyboard, but don't fail if it doesn't work
-    let keyboard_grabbed = grab_keyboard(conn, root).is_ok();
-
     let result = loop {
         match conn.wait_for_event()? {
             xcb::Event::X(x::Event::ButtonPress(event)) if event.detail() == SELECTION_BUTTON => {
@@ -219,10 +198,8 @@ pub fn wait_for_location(
                     color::window_rect(conn, root, (event.root_x(), event.root_y(), 1, 1))?;
                 break Some(pixels[0]);
             }
-            xcb::Event::X(x::Event::KeyPress(event))
-                if keyboard_grabbed && event.detail() == ESC_KEY =>
-            {
-                break None
+            xcb::Event::X(x::Event::ButtonPress(event)) if event.detail() == CANCEL_BUTTON => {
+                break None;
             }
             xcb::Event::X(x::Event::MotionNotify(event)) => {
                 let new_cursor = create_new_cursor(
@@ -245,11 +222,6 @@ pub fn wait_for_location(
     conn.send_request(&x::UngrabPointer {
         time: x::CURRENT_TIME,
     });
-    if keyboard_grabbed {
-        conn.send_request(&x::UngrabKeyboard {
-            time: x::CURRENT_TIME,
-        });
-    }
     conn.send_request(&x::FreeCursor {
         cursor: x::Cursor::new(cursor),
     });
