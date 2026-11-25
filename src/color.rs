@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Result};
-use std;
 use xcb::xproto;
 use xcb::Connection;
 
@@ -96,7 +95,7 @@ pub fn window_rect(
         y,
         width,
         height,
-        std::u32::MAX,
+        u32::MAX,
     )
     .get_reply()?;
 
